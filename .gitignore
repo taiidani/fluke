@@ -1,0 +1,8 @@
+# Generated files
+public
+internal/proto/flukeproto
+node_modules
+cache
+dist
+
+*.lock
