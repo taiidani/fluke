@@ -1,6 +1,12 @@
 # Configuration Reference
 
-Both server and agent are configured via HCL files passed with `--config`. Sensitive values can be supplied as environment variables using `$VAR_NAME` syntax anywhere in the config.
+Both server and agent are configured via HCL files passed with `--config`.
+
+Environment variables are used only as token fallbacks:
+- `agent.token`: if empty or whitespace in HCL, falls back to `FLUKE_TOKEN`.
+- `server.agent_tokens`: if the HCL list has no non-empty entries after trimming, falls back to `FLUKE_AGENT_TOKENS` (comma-separated, trimmed, empty entries ignored).
+
+There is no generic `$VAR` / `${VAR}` interpolation in other config fields.
 
 ---
 
@@ -10,7 +16,7 @@ Both server and agent are configured via HCL files passed with `--config`. Sensi
 server {
   listen_grpc  = ":7070"
   listen_http  = ":7071"
-  agent_tokens = ["$FLUKE_TOKEN"]
+  agent_tokens = ["token-a", "token-b"]
 
   git { ... }
   tls { ... }
@@ -26,7 +32,7 @@ server {
 |-------|---------|-------------|
 | `listen_grpc` | `":7070"` | Address for the gRPC server |
 | `listen_http` | `":7071"` | Address for the web UI and HTTP API |
-| `agent_tokens` | — | **Required.** List of accepted agent tokens |
+| `agent_tokens` | — | **Required.** List of accepted agent tokens. If all entries are empty/whitespace, uses `FLUKE_AGENT_TOKENS` CSV fallback |
 
 ### `server.git`
 
@@ -89,7 +95,7 @@ server {
 ```hcl
 agent {
   server_url = "grpcs://fluke.internal:7070"
-  token      = "$FLUKE_TOKEN"
+  token      = "agent-token"
   name       = "web-01"
 
   labels = {
@@ -108,7 +114,7 @@ agent {
 | Field | Default | Description |
 |-------|---------|-------------|
 | `server_url` | — | **Required.** `grpcs://` for TLS, `grpc://` for plaintext |
-| `token` | — | **Required.** Pre-shared token matching a server `agent_tokens` entry |
+| `token` | — | **Required.** Pre-shared token matching a server `agent_tokens` entry. If empty/whitespace, uses `FLUKE_TOKEN` fallback |
 | `name` | system hostname | Display name in UI and CLI |
 | `labels` | `{}` | Key/value labels used to match this host against task selectors |
 

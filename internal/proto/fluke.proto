@@ -1,0 +1,379 @@
+syntax = "proto3";
+
+package fluke.v1;
+
+option go_package = "github.com/taiidani/fluke/internal/proto/flukeproto";
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AgentService
+//
+// Exposed by the server. Each agent opens a single bidirectional stream on
+// startup via Connect and holds it open for the lifetime of the connection.
+//
+// Protocol:
+//   1. Agent sends RegisterRequest as the first AgentMessage.
+//   2. Server replies with RegisterAck (or closes the stream on auth failure).
+//   3. Server and agent freely exchange messages over the open stream.
+//
+// Authentication:
+//   Tokens are passed in gRPC metadata: Authorization: Bearer <token>
+//   The server validates the token before accepting the stream.
+// ═════════════════════════════════════════════════════════════════════════════
+
+service AgentService {
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+// ─────────────────────────────────────────────
+// AgentMessage — upward (agent → server)
+// ─────────────────────────────────────────────
+
+message AgentMessage {
+  oneof payload {
+    RegisterRequest register      = 1;
+    StateReport     state_report  = 2;
+    StepLogLine     log_line      = 3;
+    StepResult      step_result   = 4;
+    TaskComplete    task_complete = 5;
+    Heartbeat       heartbeat     = 6;
+  }
+}
+
+// ─────────────────────────────────────────────
+// ServerMessage — downward (server → agent)
+// ─────────────────────────────────────────────
+
+message ServerMessage {
+  oneof payload {
+    RegisterAck        register_ack         = 1;
+    RequestStateReport request_state_report = 2;
+    ExecuteTask        execute_task         = 3;
+    CancelTask         cancel_task          = 4;
+  }
+}
+
+// ─────────────────────────────────────────────
+// Registration
+// ─────────────────────────────────────────────
+
+// RegisterRequest is the first message sent by an agent when it connects.
+// hostname is resolved automatically via os.Hostname() — not user-configured.
+message RegisterRequest {
+  string              hostname = 1;
+  map<string, string> labels   = 2;
+}
+
+// RegisterAck acknowledges successful registration and provides the
+// server-assigned agent_id for this connection session.
+message RegisterAck {
+  string agent_id = 1;
+}
+
+// ─────────────────────────────────────────────
+// State reporting
+//
+// The server sends RequestStateReport to ask the agent to evaluate check
+// expressions for a set of tasks and report current state. The agent runs
+// all checks and replies with a StateReport containing per-step results.
+// ─────────────────────────────────────────────
+
+message RequestStateReport {
+  string            report_id = 1; // Correlation ID echoed back in StateReport
+  repeated TaskSpec tasks     = 2;
+}
+
+message StateReport {
+  string             report_id   = 1; // Echoes RequestStateReport.report_id
+  repeated TaskState task_states = 2;
+}
+
+message TaskState {
+  string                   task_name    = 1;
+  repeated StepCheckResult step_results = 2;
+}
+
+// StepCheckResult is the outcome of running a step's check expression.
+// satisfied=true means the check exited 0 — the step is already done.
+// satisfied=false (or no check present) means the step needs to run.
+message StepCheckResult {
+  string       step_name     = 1;
+  bool         satisfied     = 2; // Deprecated compatibility field.
+  string       stderr        = 3; // Check stderr, useful for debugging.
+  CheckOutcome check_outcome = 4; // Explicit check operation outcome.
+}
+
+// ─────────────────────────────────────────────
+// Task execution
+//
+// The server sends ExecuteTask to instruct the agent to run a task.
+// The agent streams StepLogLine messages as output is produced, then sends
+// a StepResult when each step finishes. When all steps are done (or the task
+// is aborted), the agent sends TaskComplete.
+// ─────────────────────────────────────────────
+
+message ExecuteTask {
+  string   execution_id = 1; // Correlation ID for this execution run
+  TaskSpec task         = 2;
+}
+
+// CancelTask instructs the agent to abort a running task.
+message CancelTask {
+  string execution_id = 1;
+}
+
+// StepLogLine carries incremental stdout/stderr output from a running step.
+// These are emitted as output is produced, before StepResult is sent.
+message StepLogLine {
+  string execution_id      = 1;
+  string step_name         = 2;
+  LogStream stream         = 3;
+  string text              = 4; // One line or chunk of output
+  int64  timestamp_unix_ms = 5;
+}
+
+// StepResult reports the final outcome of a step. stdout/stderr are not
+// repeated here — they were already streamed via StepLogLine.
+message StepResult {
+  string      execution_id = 1;
+  string      step_name    = 2;
+  StepOutcome outcome      = 3;
+  int32       exit_code    = 4;
+  int64       duration_ms  = 5;
+}
+
+// TaskComplete signals that a task execution has ended, successfully or not.
+message TaskComplete {
+  string      execution_id = 1;
+  TaskOutcome outcome      = 2;
+}
+
+// ─────────────────────────────────────────────
+// Keepalive
+// ─────────────────────────────────────────────
+
+message Heartbeat {
+  int64 timestamp_unix = 1;
+}
+
+// ─────────────────────────────────────────────
+// Shared structures
+// ─────────────────────────────────────────────
+
+// TaskSpec is the server's compiled representation of a task, sent to agents.
+// All HCL variables and locals are resolved before transmission — agents
+// never see or parse HCL directly.
+message TaskSpec {
+  string            name                   = 1;
+  string            description            = 2;
+  repeated StepSpec steps                  = 3;
+  int32             check_interval_seconds = 4; // 0 = use server default (180)
+}
+
+// StepSpec is a single step within a TaskSpec.
+message StepSpec {
+  string              name        = 1;
+  string              command     = 2;
+  string              check       = 3; // Optional idempotency check expression
+  string              working_dir = 4;
+  map<string, string> env         = 5;
+  string              run_as      = 6; // Optional — unix user to run as via sudo
+  OnFailure           on_failure  = 7;
+}
+
+// ─────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────
+
+enum LogStream {
+  LOG_STREAM_UNSPECIFIED = 0;
+  LOG_STREAM_STDOUT      = 1;
+  LOG_STREAM_STDERR      = 2;
+}
+
+enum StepOutcome {
+  STEP_OUTCOME_UNSPECIFIED = 0;
+  STEP_OUTCOME_SKIPPED     = 1; // Check passed — command not run
+  STEP_OUTCOME_SUCCESS     = 2; // Command ran and exited 0
+  STEP_OUTCOME_FAILED      = 3; // Command ran and exited non-zero
+}
+
+enum CheckOutcome {
+  CHECK_OUTCOME_UNSPECIFIED     = 0;
+  CHECK_OUTCOME_SATISFIED       = 1;
+  CHECK_OUTCOME_DRIFT           = 2;
+  CHECK_OUTCOME_EXECUTION_ERROR = 3;
+}
+
+enum TaskOutcome {
+  TASK_OUTCOME_UNSPECIFIED = 0;
+  TASK_OUTCOME_SUCCESS     = 1; // All steps succeeded or were satisfied
+  TASK_OUTCOME_FAILED      = 2; // Aborted due to step failure
+  TASK_OUTCOME_CANCELLED   = 3; // Cancelled via CancelTask
+}
+
+enum OnFailure {
+  ON_FAILURE_ABORT    = 0; // Default — stop task on step failure
+  ON_FAILURE_CONTINUE = 1; // Proceed to next step despite failure
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ManagementService
+//
+// Used by the CLI and web UI to query server state and trigger operations.
+// ═════════════════════════════════════════════════════════════════════════════
+
+service ManagementService {
+  rpc ListAgents       (ListAgentsRequest)       returns (ListAgentsResponse);
+  rpc GetAgent         (GetAgentRequest)         returns (GetAgentResponse);
+  rpc ListDrift        (ListDriftRequest)        returns (ListDriftResponse);
+  rpc ListEvents       (ListEventsRequest)       returns (ListEventsResponse);
+  rpc StreamExecution  (StreamExecutionRequest)  returns (stream ExecutionEvent);
+  rpc TriggerReconcile (TriggerReconcileRequest) returns (stream ReconciliationEvent);
+}
+
+// ─────────────────────────────────────────────
+// Agents
+// ─────────────────────────────────────────────
+
+message ListAgentsRequest {}
+
+message ListAgentsResponse {
+  repeated AgentSummary agents = 1;
+}
+
+message GetAgentRequest {
+  string hostname = 1; // Stable across reconnects; use AgentSummary.hostname from ListAgents
+}
+
+message GetAgentResponse {
+  AgentSummary          agent  = 1;
+  repeated EventSummary events = 2; // Recent reconciliation history for this agent
+}
+
+message AgentSummary {
+  string              agent_id       = 1;
+  string              hostname       = 2;
+  map<string, string> labels         = 3;
+  AgentStatus         status         = 4;
+  int64               last_seen_unix = 5;
+}
+
+enum AgentStatus {
+  AGENT_STATUS_UNKNOWN      = 0;
+  AGENT_STATUS_CONNECTED    = 1;
+  AGENT_STATUS_DISCONNECTED = 2;
+}
+
+// ─────────────────────────────────────────────
+// Drift
+// ─────────────────────────────────────────────
+
+message ListDriftRequest {}
+
+message ListDriftResponse {
+  repeated DriftEntry entries = 1;
+}
+
+message DriftEntry {
+  string agent_id      = 1;
+  string hostname      = 2;
+  string task_name     = 3;
+  string step_name     = 4;
+  int64  detected_unix = 5;
+}
+
+// ─────────────────────────────────────────────
+// Events
+// ─────────────────────────────────────────────
+
+message ListEventsRequest {
+  string agent_id  = 1; // Optional filter
+  string task_name = 2; // Optional filter
+  int32  limit     = 3; // 0 = use server default
+}
+
+message ListEventsResponse {
+  repeated EventSummary events = 1;
+}
+
+message EventSummary {
+  string      event_id     = 1;
+  string      agent_id     = 2;
+  string      hostname     = 3;
+  string      task_name    = 4;
+  TaskOutcome outcome      = 5;
+  int64       started_unix = 6;
+  int64       ended_unix   = 7;
+}
+
+// ─────────────────────────────────────────────
+// Execution streaming
+//
+// StreamExecution allows a management client to follow live output from an
+// in-progress execution. The server replays buffered events for clients that
+// connect mid-execution, then continues with live events until TaskComplete.
+// ─────────────────────────────────────────────
+
+message StreamExecutionRequest {
+  string execution_id = 1;
+}
+
+// ExecutionEvent is a forwarded event from the AgentService stream,
+// fanned out to management clients watching a specific execution.
+message ExecutionEvent {
+  oneof event {
+    StepLogLine  log_line      = 1;
+    StepResult   step_result   = 2;
+    TaskComplete task_complete = 3;
+  }
+}
+
+// ─────────────────────────────────────────────
+// Reconciliation triggering
+//
+// TriggerReconcile initiates reconciliation and streams progress back to the
+// caller. The stream closes after ReconcileComplete is emitted.
+// ─────────────────────────────────────────────
+
+message TriggerReconcileRequest {
+  oneof target {
+    string task_name = 1; // All agents whose labels match this task's selector
+    string agent_id  = 2; // All tasks matching this agent's labels
+    bool   all       = 3; // Everything
+  }
+}
+
+message ReconciliationEvent {
+  oneof event {
+    ReconcileStarted      started       = 1; // Emitted once at the beginning
+    AgentReconcileStarted agent_started = 2; // Per agent as it begins
+    ExecutionEvent        execution     = 3; // Forwarded live from AgentService
+    AgentReconcileResult  agent_result  = 4; // Per agent when it finishes
+    ReconcileComplete     complete      = 5; // Final event — stream closes after
+  }
+}
+
+message ReconcileStarted {
+  int32 agents_targeted = 1;
+  int64 started_unix    = 2;
+}
+
+message AgentReconcileStarted {
+  string agent_id  = 1;
+  string hostname  = 2;
+  string task_name = 3;
+}
+
+message AgentReconcileResult {
+  string      agent_id  = 1;
+  string      hostname  = 2;
+  string      task_name = 3;
+  TaskOutcome outcome   = 4;
+}
+
+message ReconcileComplete {
+  int32 succeeded  = 1;
+  int32 failed     = 2;
+  int32 skipped    = 3; // Agents already in desired state — no execution dispatched
+  int64 ended_unix = 4;
+}
