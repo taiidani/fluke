@@ -17,13 +17,17 @@ Tokens are opaque strings with no built-in identity or permission model — any 
 
 **Generation:** `openssl rand -hex 32`
 
-Never commit tokens to Git. Use environment variable interpolation in config files:
+Never commit tokens to Git. Use the explicit token fallback environment variables:
 
 ```hcl
 agent {
-  token = "$FLUKE_AGENT_TOKEN"
+  # If token is empty/omitted, FLUKE_TOKEN is used
+  token = ""
 }
 ```
+
+For server-side tokens, `server.agent_tokens` falls back to `FLUKE_AGENT_TOKENS`
+when the configured list is empty after trimming.
 
 ## The Real Threat Model
 
